@@ -27,18 +27,43 @@ Write the HeXO game logic:
 - Game state must conform to whatever abstract `Game` interface the AlphaZero framework expects (from the Colab notebook).
 
 ### 2. Board Representation for the Neural Network
-The board is infinite, so we cannot use a fixed-size grid naively. Approaches to explore:
-- **Sliding window / bounding box:** Crop a fixed-size region (e.g., 21x21 hex grid) centered on the centroid of all placed pieces. Encode as multi-channel 2D tensor (channel 0 = current player's stones, channel 1 = opponent's stones, optionally channel 2 = valid moves mask). Pad with zeros outside the window.
-- **Relative encoding:** Always center the view on the last move or center of mass.
-- The window size must be large enough to capture all strategically relevant pieces (6-in-a-row goal + 8-cell placement radius means the relevant area grows but has practical limits).
-- Hex grids can be mapped to offset or axial 2D arrays for CNN input.
+**Approach: Dynamic Bounding Box + Fully Convolutional Network (FCN).**
+
+The infinite board is encoded as the tight bounding box of all placed pieces, padded
+by `max_placement_dist` (8) cells in every direction. This guarantees:
+- **0% piece loss** — every placed stone is always inside the grid, by construction.
+- **All legal moves are in-bounds** — the +8 padding covers the placement rule exactly.
+- **All empty gaps between pieces are visible** — the CNN sees the full spatial layout.
+- **Grid grows organically** — small early game (~17x17), larger only when pieces spread.
+
+Encoding: 3-channel `(3, H, W)` float32 tensor where H and W vary per state:
+  - Channel 0: current player's stones
+  - Channel 1: opponent's stones
+  - Channel 2: empty cells (1 where empty, 0 where occupied)
+
+For batched inference (parallel self-play), states are padded to the max (H, W) in
+the batch with zeros, and padding cells are masked as illegal in the policy output.
+
+**Why not a fixed window?** A fixed window (e.g. 21x21 or 51x51) risks losing track
+of pieces if the game spreads beyond the window. During self-play training the AI
+makes unpredictable moves, and an adversary could deliberately spread to exploit blind
+spots. The dynamic bounding box eliminates this risk entirely.
+
+**Why not GNN/Transformer?** GNNs require many layers for global propagation and add
+PyTorch Geometric complexity. Transformers scale O(N^2). The FCN approach is proven
+(AlphaZero for Go), simple, and fast on GPU.
 
 ### 3. Neural Network Architecture
-- Start with a **ResNet**-style architecture (similar to AlphaZero): several residual blocks with batch norm + ReLU, dual heads (policy + value).
-- Policy head outputs a probability distribution over all legal moves (mapped to the window grid positions).
-- Value head outputs a scalar [-1, 1] estimating win probability for the current player.
-- The hex grid topology means convolution kernels should ideally respect 6-neighbor connectivity — consider **hex-aware convolutions** or standard convolutions on an axial-coordinate 2D array (which naturally preserves adjacency for 4 of 6 neighbors; the other 2 are diagonal in the array).
-- Architecture size should scale with the window size. Start modest (e.g., 5-10 res blocks, 128 filters) and scale up given the 4090's capability.
+The NN must be **fully convolutional** (no FC layers in the body) to accept the
+variable-size grid input.
+
+- **Body:** ResNet-style residual blocks: Conv2d → BatchNorm2d → ReLU, with skip
+  connections. No fully connected layers. Accepts any (3, H, W) input.
+- **Policy head:** Conv2d → (1, H, W) → flatten → H*W action logits. Automatically
+  scales with the grid. Illegal moves are masked before softmax.
+- **Value head:** GlobalAvgPool (kills spatial dims) → FC → tanh → scalar in [-1, 1].
+  Always produces a fixed-size output regardless of input grid dimensions.
+- Start with 5-10 res blocks, 128 filters. Scale up given the 4090's capability.
 
 ### 4. MCTS + Search Depth / Time Control
 - AlphaZero uses **MCTS (Monte Carlo Tree Search)** guided by the neural network (no random rollouts).
@@ -72,8 +97,9 @@ Training must be parallelized to fully utilize the hardware:
 
 ### Phase 2: AlphaZero Framework Adaptation
 - Port/adapt the Colab notebook's AlphaZero framework to work with HeXO.
-- Implement board-to-tensor encoding (sliding window approach).
-- Define the neural network architecture.
+- Implement dynamic bounding box encoding (variable-size grid, 0% piece loss).
+- Build fully convolutional ResNet (no FC layers in body) for variable-size input.
+- Adapt MCTS to handle variable action space sizes per state.
 
 ### Phase 3: Training Pipeline
 - Self-play data generation (parallelized on GPU).
@@ -98,7 +124,6 @@ HeXO-alpha-zero/
     self_play.py     # Parallel self-play game generation (multiprocessing workers)
     inference.py     # Batched GPU inference server for MCTS evaluations
     arena.py         # Model evaluation (pit models against each other)
-    encode.py        # Board state -> tensor encoding
     pipeline.py      # Orchestrator: launches self-play workers, inference server, and trainer
   tests/
     test_game.py     # Game logic tests
