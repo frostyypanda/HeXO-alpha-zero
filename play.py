@@ -169,9 +169,11 @@ def main():
     parser.add_argument('--speed', type=float, default=1.0,
                         help='Playback speed for AI vs AI in seconds per move '
                              '(0=instant, 0.5=fast, 2=slow). Default: 1.0')
+    parser.add_argument('--win-length', type=int, default=5,
+                        help='In-a-row to win (default: 5, official HeXO: 6)')
     args = parser.parse_args()
 
-    game = HeXOGame()
+    game = HeXOGame(win_length=args.win_length)
 
     mcts = None
     if args.mode in ('hva', 'ava'):

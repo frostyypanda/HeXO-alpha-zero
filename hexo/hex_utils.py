@@ -48,13 +48,13 @@ def count_in_direction(stones, q, r, dq, dr):
     return count
 
 
-def check_line_through(stones, q, r):
-    """Check if placing a stone at (q,r) (already in `stones`) completes a line of 6+
-    along any of the 3 axes. Returns True if a winning line is found."""
+def check_line_through(stones, q, r, win_length=6):
+    """Check if placing a stone at (q,r) (already in `stones`) completes a line
+    of `win_length`+ along any of the 3 axes. Returns True if a winning line is found."""
     for dq, dr in LINE_AXES:
         total = 1 + count_in_direction(stones, q, r, dq, dr) \
                   + count_in_direction(stones, q, r, -dq, -dr)
-        if total >= 6:
+        if total >= win_length:
             return True
     return False
 

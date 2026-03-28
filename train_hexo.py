@@ -32,6 +32,8 @@ def main():
     parser.add_argument('--num-hidden', type=int, default=None)
     parser.add_argument('--resume', type=int, default=None,
                         help='Resume from iteration N')
+    parser.add_argument('--win-length', type=int, default=None,
+                        help='In-a-row to win (default: 5, official HeXO: 6)')
     parser.add_argument('--cpu', action='store_true', help='Force CPU')
     parser.add_argument('--save-dir', type=str, default=None)
     args = parser.parse_args()
@@ -61,6 +63,8 @@ def main():
         config['num_hidden'] = args.num_hidden
     if args.resume is not None:
         config['resume_iteration'] = args.resume
+    if args.win_length is not None:
+        config['win_length'] = args.win_length
     if args.cpu:
         config['device'] = 'cpu'
     if args.save_dir is not None:

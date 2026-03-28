@@ -13,6 +13,7 @@ def get_default_args():
     return {
         # --- Game ---
         'max_placement_dist': 8,
+        'win_length': 5,               # in-a-row to win (5 for training, 6 for official HeXO)
 
         # --- Model ---
         'num_resBlocks': 10,

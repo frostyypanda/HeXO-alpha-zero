@@ -160,7 +160,8 @@ def self_play_worker(worker_id, game_args, mcts_args, request_queue,
     Self-play worker process. Plays `num_games` games and puts training
     samples into result_queue.
     """
-    game = HeXOGame(**game_args)
+    game = HeXOGame(max_placement_dist=game_args.get('max_placement_dist', 8),
+                    win_length=game_args.get('win_length', 5))
     max_moves = mcts_args.get('max_moves_per_game', 200)
 
     for game_num in range(num_games):

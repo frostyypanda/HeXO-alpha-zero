@@ -82,8 +82,9 @@ class HeXOGame:
                            placement (default 8, per HeXO rules).
     """
 
-    def __init__(self, max_placement_dist=8):
+    def __init__(self, max_placement_dist=8, win_length=6):
         self.max_placement_dist = max_placement_dist
+        self.win_length = win_length
 
     # -------------------------------------------------------------------------
     # Dynamic grid helpers
@@ -289,7 +290,7 @@ class HeXOGame:
         state.total_moves += 1
         state.moves_left_in_turn -= 1
 
-        if check_line_through(state.get_stones(player), q, r):
+        if check_line_through(state.get_stones(player), q, r, self.win_length):
             state.winner = player
 
         if state.moves_left_in_turn == 0:

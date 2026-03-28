@@ -12,7 +12,9 @@ Train a local AI to play **HeXO** (Infinity Hexagonal Tic-Tac-Toe) using the Alp
   - Player 1 places **1 hex** (opening move).
   - Player 2 places **2 hexes**.
   - All subsequent turns: **2 hexes** per player.
-- **Win condition:** First to align **6 of their own hexes** in a straight line along any of the 3 axes.
+- **Win condition:** First to align **N of their own hexes** in a straight line along any of the 3 axes.
+  - Official HeXO: N=6. Training default: N=5 (configurable via `--win-length`).
+  - Curriculum: start with lower N for faster training signal, then increase.
 - **Placement rule:** A new hex must be placed **at most 8 cells apart** from any existing hex (prevents scattered play).
 - **No fixed board size** — the board expands dynamically as players place hexes.
 

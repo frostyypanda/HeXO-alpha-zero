@@ -69,7 +69,8 @@ def parallel_self_play(game, model, args, num_games, num_workers=8):
     games_per_worker = num_games // num_workers
     remainder = num_games % num_workers
 
-    game_args = {'max_placement_dist': game.max_placement_dist}
+    game_args = {'max_placement_dist': game.max_placement_dist,
+                  'win_length': game.win_length}
     mcts_args = {
         'C': args.get('C', 2),
         'num_searches': args.get('num_searches', 60),
@@ -136,7 +137,8 @@ def run_pipeline(args):
     device = torch.device(args.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
     print(f"Device: {device}")
 
-    game = HeXOGame(max_placement_dist=args.get('max_placement_dist', 8))
+    game = HeXOGame(max_placement_dist=args.get('max_placement_dist', 8),
+                    win_length=args.get('win_length', 5))
 
     # Initialize model
     model = ResNet(
