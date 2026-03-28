@@ -90,27 +90,31 @@ class TestMCTS:
 
 
 class TestNode:
-    def test_ucb_unvisited_child(self, game, mcts_args):
+    def test_lazy_expansion(self, game, mcts_args):
+        """set_policy stores priors without creating child states."""
         state = game.get_initial_state()
-        parent = Node(game, mcts_args, state)
-        parent.visit_count = 10
-        child = Node(game, mcts_args, state, parent=parent, prior=0.5)
-        ucb = parent._ucb(child)
-        # Unvisited child should get high UCB due to prior
-        assert ucb > 0
+        state = game.get_next_state(state, game.axial_to_action(state, 0, 0), 1)
+        node = Node(game, mcts_args, state)
+        node.visit_count = 1
+        # Set policy with some actions
+        policy = {50: 0.4, 100: 0.3, 150: 0.3}
+        node.set_policy(policy)
+        assert not node.is_leaf()
+        assert len(node.children) == 0  # no children created yet
 
-    def test_select_prefers_unvisited(self, game, mcts_args):
+    def test_select_or_expand_creates_child(self, game, mcts_args):
+        """First selection should lazily create a child node."""
         state = game.get_initial_state()
-        parent = Node(game, mcts_args, state)
-        parent.visit_count = 5
-        c1 = Node(game, mcts_args, state, parent=parent, prior=0.3)
-        c1.visit_count = 3
-        c1.value_sum = 0.5
-        c2 = Node(game, mcts_args, state, parent=parent, prior=0.3)
-        c2.visit_count = 0  # unvisited
-        parent.children = [c1, c2]
-        selected = parent.select()
-        assert selected is c2  # should prefer unvisited
+        state = game.get_next_state(state, game.axial_to_action(state, 0, 0), 1)
+        node = Node(game, mcts_args, state)
+        node.visit_count = 1
+        valid = game.get_valid_moves(state)
+        legal = np.where(valid > 0)[0][:3]
+        policy = {int(a): 1.0 / 3 for a in legal}
+        node.set_policy(policy)
+        child = node.select_or_expand()
+        assert child is not None
+        assert len(node.children) == 1  # only one child created
 
 
 if __name__ == '__main__':

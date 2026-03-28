@@ -10,6 +10,9 @@ Key adaptations from the reference notebook:
     tells it whose perspective to evaluate from.
   - Supports both fixed simulation count and time-limited search.
   - Dirichlet noise at root for exploration during training.
+  - **Lazy expansion**: child states are only created when first visited,
+    not for all legal moves at once. Critical for HeXO where 300+ moves
+    may be legal but only a handful are visited per search.
 """
 
 import math
@@ -19,76 +22,84 @@ import torch
 
 
 class Node:
-    """A node in the MCTS tree."""
+    """A node in the MCTS tree. Uses lazy expansion for efficiency."""
 
     __slots__ = ('game', 'args', 'state', 'parent', 'action_taken',
-                 'prior', 'children', 'visit_count', 'value_sum')
+                 'prior', 'children', 'visit_count', 'value_sum',
+                 '_unexpanded_actions', '_action_priors')
 
     def __init__(self, game, args, state, parent=None, action_taken=None, prior=0.0):
         self.game = game
         self.args = args
         self.state = state
         self.parent = parent
-        self.action_taken = action_taken  # axial (q, r) that led here
+        self.action_taken = action_taken
         self.prior = prior
 
-        self.children = []
+        self.children = {}           # action_idx -> Node
         self.visit_count = 0
         self.value_sum = 0.0
+        self._unexpanded_actions = []  # list of (action_idx, prior)
+        self._action_priors = {}       # action_idx -> prior (for UCB on unexpanded)
 
-    def is_expanded(self):
-        return len(self.children) > 0
-
-    def select(self):
-        """Select the child with the highest UCB score."""
-        best_child = None
-        best_ucb = -math.inf
-
-        for child in self.children:
-            ucb = self._ucb(child)
-            if ucb > best_ucb:
-                best_child = child
-                best_ucb = ucb
-
-        return best_child
-
-    def _ucb(self, child):
-        """Upper confidence bound: Q + C * prior * sqrt(parent_visits) / (1 + child_visits)."""
-        if child.visit_count == 0:
-            q_value = 0.0
-        else:
-            # Value is from child's perspective; we want parent's perspective
-            q_value = 1.0 - ((child.value_sum / child.visit_count) + 1.0) / 2.0
-        return q_value + self.args['C'] * child.prior * (
-            math.sqrt(self.visit_count) / (1 + child.visit_count)
-        )
-
-    def expand(self, policy):
-        """
-        Expand node using the policy distribution.
-
+    def set_policy(self, policy_dict):
+        """Store the policy for lazy expansion.
         Args:
-            policy: dict mapping action_index -> probability (only legal moves).
+            policy_dict: {action_idx: probability}
         """
-        for action_idx, prob in policy.items():
-            if prob > 0:
-                child_state = self.game.get_next_state(
-                    self.state, action_idx, self.state.current_player
-                )
-                # Store the axial coords for this action (for readable output)
-                q, r = self.game.action_to_axial(self.state, action_idx)
-                child = Node(
-                    self.game, self.args, child_state,
-                    parent=self, action_taken=action_idx, prior=prob,
-                )
-                self.children.append(child)
+        self._action_priors = policy_dict
+        self._unexpanded_actions = list(policy_dict.keys())
+
+    def is_leaf(self):
+        """True if this node has not been evaluated by the NN yet."""
+        return not self._action_priors and not self.children
+
+    def select_or_expand(self):
+        """Select best child by UCB, creating it lazily if needed.
+        Returns the selected child node."""
+        best_action = None
+        best_ucb = -math.inf
+        C = self.args['C']
+        sqrt_parent = math.sqrt(self.visit_count)
+
+        # Score all actions (both expanded and unexpanded)
+        for action_idx, prior in self._action_priors.items():
+            child = self.children.get(action_idx)
+            if child is not None:
+                if child.visit_count == 0:
+                    q_value = 0.0
+                else:
+                    q_value = 1.0 - ((child.value_sum / child.visit_count) + 1.0) / 2.0
+                ucb = q_value + C * prior * sqrt_parent / (1 + child.visit_count)
+            else:
+                # Unexpanded: visit_count=0, so q=0
+                ucb = C * prior * sqrt_parent  # / (1+0) = same
+            if ucb > best_ucb:
+                best_ucb = ucb
+                best_action = action_idx
+
+        if best_action is None:
+            return None
+
+        # Lazily create the child if not yet expanded
+        if best_action not in self.children:
+            child_state = self.game.get_next_state(
+                self.state, best_action, self.state.current_player
+            )
+            child = Node(
+                self.game, self.args, child_state,
+                parent=self, action_taken=best_action,
+                prior=self._action_priors[best_action],
+            )
+            self.children[best_action] = child
+
+        return self.children[best_action]
 
     def backpropagate(self, value):
         """Propagate the evaluation value up the tree."""
         self.value_sum += value
         self.visit_count += 1
         if self.parent is not None:
-            # Flip value for opponent
             self.parent.backpropagate(self.game.get_opponent_value(value))
 
 
@@ -125,25 +136,25 @@ class MCTS:
         root.visit_count = 1  # virtual visit for UCB denominator
 
         # --- Evaluate root ---
-        policy = self._get_policy(state)
+        policy, value = self._evaluate(state)
         valid_moves = self.game.get_valid_moves(state)
         action_size = len(valid_moves)
 
         # Mask and normalize
-        policy = self._mask_and_normalize(policy, valid_moves)
+        policy_dict = self._mask_and_normalize(policy, valid_moves)
 
         # Add Dirichlet noise at root for exploration
         eps = self.args.get('dirichlet_epsilon', 0.0)
         if eps > 0:
             noise = np.random.dirichlet(
-                [self.args['dirichlet_alpha']] * len(policy)
+                [self.args['dirichlet_alpha']] * len(policy_dict)
             )
-            noisy_policy = {}
-            for i, (action_idx, prob) in enumerate(policy.items()):
-                noisy_policy[action_idx] = (1 - eps) * prob + eps * noise[i]
-            policy = noisy_policy
+            noisy = {}
+            for i, (action_idx, prob) in enumerate(policy_dict.items()):
+                noisy[action_idx] = (1 - eps) * prob + eps * noise[i]
+            policy_dict = noisy
 
-        root.expand(policy)
+        root.set_policy(policy_dict)
 
         # --- Run simulations ---
         time_limit_ms = self.args.get('time_limit_ms', None)
@@ -151,18 +162,16 @@ class MCTS:
 
         if time_limit_ms is not None:
             deadline = time.perf_counter() + time_limit_ms / 1000.0
-            sim = 0
             while time.perf_counter() < deadline:
                 self._simulate(root)
-                sim += 1
         else:
             for _ in range(num_searches):
                 self._simulate(root)
 
         # --- Collect visit counts ---
         action_probs = np.zeros(action_size, dtype=np.float32)
-        for child in root.children:
-            action_probs[child.action_taken] = child.visit_count
+        for action_idx, child in root.children.items():
+            action_probs[action_idx] = child.visit_count
 
         total = action_probs.sum()
         if total > 0:
@@ -174,45 +183,36 @@ class MCTS:
         """Run one simulation: select -> expand/evaluate -> backprop."""
         node = root
 
-        # --- Selection ---
-        while node.is_expanded():
-            node = node.select()
+        # --- Selection: walk down the tree ---
+        while not node.is_leaf():
+            node = node.select_or_expand()
+            if node is None:
+                return
 
         # --- Check terminal ---
         state = node.state
         value, is_terminal = self.game.get_value_and_terminated(state, node.action_taken)
 
         if is_terminal:
-            # Value from perspective of the player who just moved (parent's player)
             node.backpropagate(value)
             return
 
-        # --- Expansion ---
-        policy = self._get_policy(state)
+        # --- Evaluate and expand ---
+        policy, value = self._evaluate(state)
         valid_moves = self.game.get_valid_moves(state)
-        policy = self._mask_and_normalize(policy, valid_moves)
+        policy_dict = self._mask_and_normalize(policy, valid_moves)
+        node.set_policy(policy_dict)
 
-        value = self._get_value(state)
-        node.expand(policy)
-
-        # Value is from current player's perspective
         node.backpropagate(value)
 
-    def _get_policy(self, state):
-        """Get raw policy logits from the model, return as numpy array."""
+    def _evaluate(self, state):
+        """Get policy and value from the model. Returns (policy_np, value_float)."""
         encoded = self.game.get_encoded_state(state)
         tensor = torch.tensor(encoded, dtype=torch.float32,
                               device=self.model.device).unsqueeze(0)
-        policy_logits, _ = self.model(tensor)
-        return torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-
-    def _get_value(self, state):
-        """Get value estimate from the model."""
-        encoded = self.game.get_encoded_state(state)
-        tensor = torch.tensor(encoded, dtype=torch.float32,
-                              device=self.model.device).unsqueeze(0)
-        _, value = self.model(tensor)
-        return value.item()
+        policy_logits, value = self.model(tensor)
+        policy = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
+        return policy, value.item()
 
     def _mask_and_normalize(self, policy_array, valid_moves):
         """
@@ -225,7 +225,6 @@ class MCTS:
         masked = policy_array * valid_moves
         total = masked.sum()
         if total <= 0:
-            # Fallback: uniform over legal moves
             legal_indices = np.where(valid_moves > 0)[0]
             return {int(idx): 1.0 / len(legal_indices) for idx in legal_indices}
 

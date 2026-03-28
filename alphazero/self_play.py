@@ -13,10 +13,11 @@ from hexo.game import HeXOGame
 
 
 class RemoteMCTSNode:
-    """MCTS node that uses a remote inference server instead of a local model."""
+    """MCTS node with lazy expansion and remote NN evaluation."""
 
     __slots__ = ('game', 'args', 'state', 'parent', 'action_taken',
-                 'prior', 'children', 'visit_count', 'value_sum')
+                 'prior', 'children', 'visit_count', 'value_sum',
+                 '_action_priors')
 
     def __init__(self, game, args, state, parent=None, action_taken=None, prior=0.0):
         self.game = game
@@ -25,43 +26,52 @@ class RemoteMCTSNode:
         self.parent = parent
         self.action_taken = action_taken
         self.prior = prior
-        self.children = []
+        self.children = {}
         self.visit_count = 0
         self.value_sum = 0.0
+        self._action_priors = {}
 
-    def is_expanded(self):
-        return len(self.children) > 0
+    def set_policy(self, policy_dict):
+        self._action_priors = policy_dict
 
-    def select(self):
-        best_child = None
+    def is_leaf(self):
+        return not self._action_priors and not self.children
+
+    def select_or_expand(self):
+        best_action = None
         best_ucb = -math.inf
-        for child in self.children:
-            ucb = self._ucb(child)
+        C = self.args['C']
+        sqrt_parent = math.sqrt(self.visit_count)
+
+        for action_idx, prior in self._action_priors.items():
+            child = self.children.get(action_idx)
+            if child is not None:
+                if child.visit_count == 0:
+                    q_value = 0.0
+                else:
+                    q_value = 1.0 - ((child.value_sum / child.visit_count) + 1.0) / 2.0
+                ucb = q_value + C * prior * sqrt_parent / (1 + child.visit_count)
+            else:
+                ucb = C * prior * sqrt_parent
             if ucb > best_ucb:
-                best_child = child
                 best_ucb = ucb
-        return best_child
+                best_action = action_idx
 
-    def _ucb(self, child):
-        if child.visit_count == 0:
-            q_value = 0.0
-        else:
-            q_value = 1.0 - ((child.value_sum / child.visit_count) + 1.0) / 2.0
-        return q_value + self.args['C'] * child.prior * (
-            math.sqrt(self.visit_count) / (1 + child.visit_count)
-        )
+        if best_action is None:
+            return None
 
-    def expand(self, policy):
-        for action_idx, prob in policy.items():
-            if prob > 0:
-                child_state = self.game.get_next_state(
-                    self.state, action_idx, self.state.current_player
-                )
-                child = RemoteMCTSNode(
-                    self.game, self.args, child_state,
-                    parent=self, action_taken=action_idx, prior=prob,
-                )
-                self.children.append(child)
+        if best_action not in self.children:
+            child_state = self.game.get_next_state(
+                self.state, best_action, self.state.current_player
+            )
+            child = RemoteMCTSNode(
+                self.game, self.args, child_state,
+                parent=self, action_taken=best_action,
+                prior=self._action_priors[best_action],
+            )
+            self.children[best_action] = child
+
+        return self.children[best_action]
 
     def backpropagate(self, value):
         self.value_sum += value
@@ -109,14 +119,18 @@ def remote_mcts_search(state, game, args, worker_id, request_queue, response_que
             noisy[aidx] = (1 - eps) * prob + eps * noise[i]
         policy = noisy
 
-    root.expand(policy)
+    root.set_policy(policy)
 
     # Simulations
     num_searches = args.get('num_searches', 800)
     for _ in range(num_searches):
         node = root
-        while node.is_expanded():
-            node = node.select()
+        while not node.is_leaf():
+            node = node.select_or_expand()
+            if node is None:
+                break
+        if node is None:
+            continue
 
         value, is_terminal = game.get_value_and_terminated(node.state, node.action_taken)
         if not is_terminal:
@@ -125,15 +139,15 @@ def remote_mcts_search(state, game, args, worker_id, request_queue, response_que
             )
             vm = game.get_valid_moves(node.state)
             pol = mask_and_normalize(pa, vm)
-            node.expand(pol)
+            node.set_policy(pol)
 
         node.backpropagate(value)
 
     # Collect visit counts
     action_size = game.get_action_size(state)
     action_probs = np.zeros(action_size, dtype=np.float32)
-    for child in root.children:
-        action_probs[child.action_taken] = child.visit_count
+    for action_idx, child in root.children.items():
+        action_probs[action_idx] = child.visit_count
     total = action_probs.sum()
     if total > 0:
         action_probs /= total
@@ -145,18 +159,9 @@ def self_play_worker(worker_id, game_args, mcts_args, request_queue,
     """
     Self-play worker process. Plays `num_games` games and puts training
     samples into result_queue.
-
-    Args:
-        worker_id: unique int for this worker.
-        game_args: dict with game config (max_placement_dist).
-        mcts_args: dict with MCTS config (C, num_searches, etc.).
-        request_queue: shared queue to send inference requests.
-        response_queue: this worker's response queue.
-        result_queue: queue to put completed game samples.
-        num_games: number of games to play.
-        stop_event: multiprocessing.Event to signal shutdown.
     """
     game = HeXOGame(**game_args)
+    max_moves = mcts_args.get('max_moves_per_game', 200)
 
     for game_num in range(num_games):
         if stop_event.is_set():
@@ -164,7 +169,6 @@ def self_play_worker(worker_id, game_args, mcts_args, request_queue,
 
         memory = []
         state = game.get_initial_state()
-        max_moves = mcts_args.get('max_moves_per_game', 200)
 
         while True:
             if stop_event.is_set():
