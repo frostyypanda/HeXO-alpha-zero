@@ -13,6 +13,7 @@ Usage:
 import argparse
 import sys
 import os
+import time
 
 from hexo.game import HeXOGame, HeXOState
 
@@ -74,8 +75,14 @@ def ai_move(game, state, mcts):
     return action
 
 
-def play_game(game, mode, mcts=None):
-    """Run a full game loop."""
+def play_game(game, mode, mcts=None, playback_speed=1.0):
+    """Run a full game loop.
+
+    Args:
+        playback_speed: delay between AI moves in seconds (0 = no delay).
+            Only affects AI vs AI mode. Use higher values to slow down,
+            lower to speed up. Default 1.0s per move.
+    """
     state = game.get_initial_state()
 
     # Determine who is human / AI
@@ -93,7 +100,13 @@ def play_game(game, mode, mcts=None):
 
     print("\n=== HeXO — Infinity Hexagonal Tic-Tac-Toe ===\n")
     print("Coordinate system: axial (q, r). Enter moves as 'q r'.")
-    print("First move starts at the origin (0 0).\n")
+    print("First move starts at the origin (0 0).")
+    if mode == 'ava':
+        print(f"Playback speed: {playback_speed}s per move "
+              f"(change with --speed)")
+    print()
+
+    move_number = 0
 
     while True:
         # Show board
@@ -101,6 +114,9 @@ def play_game(game, mode, mcts=None):
         if state.move_history:
             last_entry = state.move_history[-1]
             last_moves.add((last_entry[0], last_entry[1]))
+
+        if mode == 'ava':
+            clear_screen()
         print(game.render(state, highlight=last_moves))
         print()
 
@@ -115,6 +131,8 @@ def play_game(game, mode, mcts=None):
                 # Show updated board between sub-moves
                 last_entry = state.move_history[-1]
                 last_moves = {(last_entry[0], last_entry[1])}
+                if mode == 'ava':
+                    clear_screen()
                 print(game.render(state, highlight=last_moves))
                 print()
                 if state.winner != 0:
@@ -122,13 +140,20 @@ def play_game(game, mode, mcts=None):
 
             action = get_move(player)
             state = game.get_next_state(state, action, player)
+            move_number += 1
+
+            # Delay for AI vs AI playback
+            if mode == 'ava' and playback_speed > 0:
+                time.sleep(playback_speed)
 
             if state.winner != 0:
                 break
 
     # Final board
+    if mode == 'ava':
+        clear_screen()
     print(game.render(state))
-    print("\nGame over!")
+    print(f"\nGame over! ({move_number} placements)")
 
 
 def main():
@@ -141,6 +166,9 @@ def main():
                         help='MCTS simulations per move (default: 800)')
     parser.add_argument('--time-limit', type=int, default=None,
                         help='Time limit per move in ms (overrides --num-searches)')
+    parser.add_argument('--speed', type=float, default=1.0,
+                        help='Playback speed for AI vs AI in seconds per move '
+                             '(0=instant, 0.5=fast, 2=slow). Default: 1.0')
     args = parser.parse_args()
 
     game = HeXOGame()
@@ -174,7 +202,7 @@ def main():
 
         mcts = MCTS(game, mcts_args, model)
 
-    play_game(game, args.mode, mcts)
+    play_game(game, args.mode, mcts, playback_speed=args.speed)
 
 
 if __name__ == '__main__':
