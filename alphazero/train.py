@@ -102,6 +102,9 @@ class AlphaZero:
             memory: list of (encoded_state, action_probs, value) tuples.
                     States may have different sizes.
         """
+        # Filter oversized states to prevent VRAM spikes from padding
+        max_dim = 60
+        memory = [s for s in memory if s[0].shape[1] <= max_dim and s[0].shape[2] <= max_dim]
         random.shuffle(memory)
         batch_size = self.args.get('batch_size', 64)
         total_policy_loss = 0.0
@@ -125,19 +128,21 @@ class AlphaZero:
             # Forward pass
             out_policy, out_value = self.model(batch_tensor, batch_valid)
 
-            # Remap policy targets to padded space
+            # Remap policy targets to padded space (vectorized)
             max_H, max_W = batch_tensor.shape[2], batch_tensor.shape[3]
             padded_targets = torch.zeros(
                 len(batch), max_H * max_W,
                 dtype=torch.float32, device=self.model.device
             )
             for i, (pi, (Hi, Wi)) in enumerate(zip(policy_targets, orig_sizes)):
-                for idx in range(len(pi)):
-                    if pi[idx] > 0:
-                        row = idx // Wi
-                        col = idx % Wi
-                        new_idx = row * max_W + col
-                        padded_targets[i, new_idx] = float(pi[idx])
+                pi_arr = np.asarray(pi)
+                nz = np.flatnonzero(pi_arr)
+                if len(nz) > 0:
+                    rows = nz // Wi
+                    cols = nz % Wi
+                    new_idx = rows * max_W + cols
+                    padded_targets[i, new_idx] = torch.from_numpy(
+                        pi_arr[nz].astype(np.float32)).to(self.model.device)
 
             value_targets_t = torch.tensor(
                 np.array(value_targets, dtype=np.float32).reshape(-1, 1),
