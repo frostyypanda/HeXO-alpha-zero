@@ -1,183 +1,202 @@
-# Implementation Plan: Heuristic-Bootstrapped AlphaZero
+# Implementation Plan: Heuristic-Bootstrapped Gumbel AlphaZero
 
 ## Overview
 
-Replace the curriculum-based training with a 3-stage pipeline:
-**Heuristic Player → Imitation Learning → AlphaZero Self-Play**
+3-stage pipeline: **Heuristic Player → Imitation Learning → Gumbel AlphaZero Self-Play**
+
+Key compute-saving enhancements over vanilla AlphaZero:
+- **Gumbel MCTS**: productive training at 32-50 sims (vs 200-800 for standard PUCT)
+- **Playout cap randomization**: 75% of moves use quick search → 1.4x more games/hour
+- **Progressive simulation**: start fast, increase quality as model improves
+- **Train on ALL games**: 10-100x more data than win-only filtering
 
 ### Timeline Estimate
 
-| Phase | Work | Training | Total |
-|-------|------|----------|-------|
+| Phase | Dev Time | Training Time | Wall-Clock |
+|-------|----------|---------------|------------|
 | 0: Housekeeping | 30min | — | 30min |
-| 1: Heuristic Player | 2-3h dev | 0 | 2-3h |
-| 2: Imitation Learning | 1-2h dev | 1-2h gen + 1h train | 3-5h |
-| 3: AlphaZero Training | 1h dev | 8-24h training | 9-25h |
-| 4: Eval & Polish | 2h | — | 2h |
+| 1: Heuristic Player | 2-3h | — | 2-3h |
+| 2: Imitation Learning | 1-2h dev | 1-2h data gen + 1h training | 3-5h |
+| 3: Gumbel MCTS | 3-4h | — | 3-4h |
+| 4: AlphaZero Training | 1h dev | 8-24h training | 9-25h |
+| 5: Eval & Polish | 2h | — | 2h |
 
-**Total developer time: ~7-8 hours. Total wall-clock including training: 1-2 days.**
+**Total dev time: ~10-12 hours. Training wall-clock: 1-2 days.**
 
 ---
 
-## Phase 0: Housekeeping
+## Phase 0: Housekeeping (DONE)
 
-Move superseded files to `archive/`. No code changes.
-
-**Files to archive:**
-```
-archive/
-  overnight_train.py
-  nn_curriculum_train.py
-  OVERNIGHT_PLAN.md
-  train_hexo.py
-  test_curriculum.py
-  test_curriculum2.py
-  test_seeding.py
-  test_training_signal.py
-  test_transfer.py
-  test_overnight_smoke.py
-```
-
-**Keep in place (still used):**
-- All `hexo/` files
-- All `alphazero/` files
-- `play.py`, `play_web.py`
-- `config.py`
-- All `checkpoints*/` directories
-- All log files (reference)
+Superseded files moved to `archive/`. Specs created.
 
 ---
 
 ## Phase 1: Heuristic Player
 
-**Goal:** A rule-based player that wins >90% against random at full rules.
+**Goal:** Rule-based player that wins >90% against random at full rules.
 
-### Step 1.1: Position Scoring Function
+### Step 1.1: Position Scoring (`hexo/heuristic.py`)
 
-Create `hexo/heuristic.py`.
+Score each candidate move by analyzing the 3 hex axes:
 
 ```python
 def score_move(state, q, r, player, game) -> float:
-    """Score a single candidate move for the given player."""
 ```
 
-For each of the 3 hex axes, count:
-- Own consecutive stones through (q, r): `own_len`
-- Open ends (empty cells at both ends of the line): `open_ends`
-- Opponent consecutive stones through (q, r): `opp_len`
+**Per-axis analysis:**
+- Walk outward from (q, r) along the axis in both directions
+- Count own consecutive stones: `own_len`
+- Count open ends (empty cells at line endpoints): `open_ends`
+- Count opponent consecutive stones (if move blocks): `opp_len`
 
-Scoring formula:
+**Scoring formula:**
 ```
-offense = sum over axes: base_score[own_len] * open_end_multiplier[open_ends]
-defense = sum over axes: base_score[opp_len] * open_end_multiplier[open_ends]
-score = offense + 0.9 * defense
-```
+THREAT_SCORE = {0: 0, 1: 1, 2: 4, 3: 16, 4: 64, 5+: 1000}
+OPEN_MULT = {0: 0.1, 1: 0.5, 2: 1.0}
 
-Base scores (exponential):
+offense = sum over 3 axes: THREAT_SCORE[own_len] * OPEN_MULT[open_ends]
+defense = sum over 3 axes: THREAT_SCORE[opp_len] * OPEN_MULT[opp_open_ends]
+score = offense + 0.9 * defense + small_random_noise
 ```
-base_score = {0: 0, 1: 1, 2: 4, 3: 16, 4: 64, 5+: 1000}
-```
-These values ensure a 4-in-a-row is treated as ~60x more important than a single stone.
-
-Open-end multiplier: `{0: 0.1, 1: 0.5, 2: 1.0}` (dead line is nearly worthless).
 
 ### Step 1.2: Move Selector
 
 ```python
-def heuristic_select_move(state, game, temperature=1.0) -> int:
-    """Select a move using heuristic scores with temperature-controlled sampling."""
+def heuristic_select_move(state, game, temperature=1.0) -> tuple[int, np.ndarray]:
+    """Returns (action_index, probability_distribution)."""
 ```
 
-1. Score all legal moves
-2. Apply softmax with temperature
-3. Sample from distribution
+Softmax over scores with temperature. Returns both the sampled action AND the full
+probability distribution (needed for imitation learning targets).
 
-### Step 1.3: Self-Play Game Generator
+### Step 1.3: Game Generator
 
 ```python
-def play_heuristic_game(game, temperature=1.0) -> list[tuple]:
-    """Play one game, return list of (encoded_state, move_probs, outcome)."""
+def play_heuristic_game(game, temp=1.0, max_moves=200) -> list[tuple]:
+    """Returns list of (encoded_state, move_probs, outcome) — same format as AlphaZero."""
 ```
 
-Uses the standard game loop. Records data in the same format as AlphaZero self-play.
+### Step 1.4: Tests (`tests/test_heuristic.py`)
 
-### Step 1.4: Tests
-
-`tests/test_heuristic.py`:
-- Scoring function produces expected relative ordering for known positions
-- Blocking move is top-ranked when opponent threatens win
-- Win-completing move is top-ranked when available
-- Heuristic beats random >90% in 100 games (integration test)
-- Heuristic vs heuristic games are >80% decisive (not all draws)
+- [ ] Win-completing move ranks highest when available
+- [ ] Blocking move ranks highest when opponent threatens win
+- [ ] Scores increase exponentially with line length
+- [ ] 100 games vs random: >90% win rate
+- [ ] 100 heuristic vs heuristic games: >70% decisive (not all draws)
+- [ ] Average game length < 100 moves at full rules
 
 ### Validation Gate
-Run 200 heuristic vs heuristic games at full rules (win=5, dist=8).
-**Pass criteria:** >70% decisive outcomes, average game length < 100 moves.
+200 heuristic vs heuristic games at win=5/dist=8.
+**Pass:** >70% decisive, avg length < 100 moves. **Fail:** tune scoring weights.
 
 ---
 
 ## Phase 2: Imitation Learning
 
-**Goal:** NN that can guide MCTS productively at full rules.
+**Goal:** NN that guides MCTS productively at full rules.
 
-### Step 2.1: Data Generation Script
-
-Create `alphazero/imitation.py`:
+### Step 2.1: Data Generation (`alphazero/imitation.py`)
 
 ```python
-def generate_imitation_data(game, num_games, temperature_range, ...) -> list[tuple]:
-    """Generate training data from heuristic self-play."""
+def generate_imitation_data(game, num_games=10000) -> list[tuple]:
 ```
 
-- Play 10,000 games with temperature sampled from [0.8, 2.0]
+- Play 10,000 heuristic self-play games at win=5, dist=8
+- Temperature sampled uniformly from [0.8, 2.0] per game
 - Keep ALL games (wins AND draws)
-- Record (encoded_state, heuristic_move_probs, game_outcome) per position
+- Record (encoded_state, heuristic_move_probs, outcome) per position
 - Filter oversized states (max_dim=60)
 - Target: 100k+ training samples
 
-### Step 2.2: Training Script
+### Step 2.2: Training (`train_bootstrap.py`)
 
-Create `train_bootstrap.py` (new entry point, replaces `train_hexo.py`):
-
-```
-python train_bootstrap.py --phase imitation    # Run imitation learning
-python train_bootstrap.py --phase selfplay     # Run AlphaZero self-play
-python train_bootstrap.py --phase all          # Run full pipeline
+```bash
+python train_bootstrap.py imitation          # Run imitation learning only
+python train_bootstrap.py selfplay           # Run AlphaZero from checkpoint
+python train_bootstrap.py all                # Full pipeline
 ```
 
 Imitation training:
-- Load generated data
-- Split 90/10 train/val
-- Train for 25 epochs with cosine LR decay (0.001 → 0.0001)
+- 90/10 train/val split
+- 25 epochs, cosine LR 0.001 → 0.0001, batch size 128
 - Early stopping if val loss doesn't improve for 5 epochs
-- Save checkpoint: `checkpoints_v2/imitation_final.pt`
+- Save: `checkpoints_v2/imitation_final.pt`
 
 ### Step 2.3: Validation
 
-After imitation training, run automated validation:
+1. **NN-only play** (50 games, no MCTS): games show line-building (longest line > 3)
+2. **NN+MCTS (50 sims) vs strong heuristic** (40 games): **>30% win rate**
+3. **Value correlation**: NN value vs outcome on 1000 val positions: **r > 0.3**
 
-1. **NN-only test**: Play 50 games with NN policy (no MCTS). Check that games show
-   line-building behavior (longest line in game > random average).
-
-2. **NN+MCTS vs heuristic**: Play 40 games with MCTS (50 sims) against strong heuristic.
-   **Pass criteria:** >30% win rate.
-
-3. **Value correlation**: For 1000 random positions from validation set, compare NN value
-   prediction to actual game outcome. **Pass criteria:** Pearson correlation > 0.3.
-
-**If validation fails:** generate more data (wider temperature range), train longer, or
-adjust heuristic strength.
+**If validation fails:** more data, wider temp range, or add 1-2 ply minimax to heuristic.
+**Do NOT proceed** to self-play with a model that fails validation.
 
 ---
 
-## Phase 3: AlphaZero Self-Play
+## Phase 3: Gumbel MCTS Implementation
+
+**Goal:** Replace PUCT selection with Gumbel Sequential Halving.
+
+### Step 3.1: Gumbel Selection (`alphazero/mcts.py` rewrite)
+
+Replace the existing PUCT-based selection with:
+
+**Root move selection (Gumbel):**
+1. Get NN policy prior π for all legal moves
+2. Sample Gumbel noise: g_i ~ Gumbel(0, 1) for each legal move
+3. Compute scores: s_i = log(π_i) + g_i
+4. Select top-k moves (k=16 or 32) by score
+5. Allocate simulations via Sequential Halving:
+   - Round 1: give N/(k * ceil(log2(k))) sims to each of k moves
+   - Round 2: keep top k/2 by Q-value, double their sim budget
+   - Repeat until 1 move remains
+6. The selected move's "completed" Q-value is the policy improvement target
+
+**Non-root selection (standard):**
+Below the root, use standard PUCT with NN policy priors (same as before). Gumbel
+selection only applies at the root node where we need the policy improvement guarantee.
+
+**Policy target construction:**
+For each root move i that was searched, compute:
+```
+completed_logit_i = log(π_i) + σ(q_i)
+```
+where σ(q) transforms Q-values to logit scale. The softmax of completed logits is the
+improved policy target for training.
+
+### Step 3.2: Playout Cap Randomization
+
+In self-play, for each move:
+```python
+if random.random() < 0.25:
+    sims = full_sim_count       # Full search — contributes to policy target
+    include_in_policy_training = True
+else:
+    sims = full_sim_count // 4  # Quick search — only contributes value target
+    include_in_policy_training = False
+```
+
+### Step 3.3: Tests (`tests/test_mcts.py` expanded)
+
+- [ ] Gumbel selection with k=16, N=32 sims completes without error
+- [ ] Gumbel at 32 sims produces better policy than PUCT at 32 sims (100 positions)
+- [ ] Sequential halving correctly eliminates half the candidates each round
+- [ ] Completed policy sums to 1.0 and is valid probability distribution
+- [ ] Playout cap correctly flags positions for policy/value-only training
+
+### Validation Gate
+On 100 positions from heuristic games, compare PUCT vs Gumbel at 32 sims:
+**Pass:** Gumbel's top-1 move matches 200-sim PUCT more often than 32-sim PUCT does.
+
+---
+
+## Phase 4: AlphaZero Self-Play Training
 
 **Goal:** Model that surpasses heuristic through self-play.
 
-### Step 3.1: Pipeline Configuration
+### Step 4.1: Pipeline Configuration
 
-Update `config.py` with v2 defaults:
-
+Update `config.py`:
 ```python
 V2_CONFIG = {
     'win_length': 5,
@@ -185,13 +204,15 @@ V2_CONFIG = {
     'num_resBlocks': 10,
     'num_hidden': 128,
     'C': 2,
-    'num_searches': 200,
+    'gumbel_top_k': 16,
+    'num_searches': 32,          # Starting sims (progressive)
+    'playout_cap_fraction': 0.25,
     'dirichlet_epsilon': 0.25,
     'dirichlet_alpha': 0.15,
     'temperature': 1.0,
-    'temperature_threshold': 30,  # switch to 0.3 after move 30
+    'temperature_threshold': 30,
     'num_iterations': 200,
-    'num_selfPlay_iterations': 50,  # games per worker per iteration
+    'num_selfPlay_iterations': 50,
     'num_epochs': 4,
     'batch_size': 128,
     'lr': 0.001,
@@ -203,61 +224,55 @@ V2_CONFIG = {
 }
 ```
 
-### Step 3.2: Training Loop Modifications
+### Step 4.2: Self-Play Modifications
 
-Minimal changes to existing `pipeline.py`:
+Changes to `alphazero/self_play.py`:
+- Use Gumbel MCTS at root, standard PUCT below root
+- Apply playout cap randomization per move
+- Flag each sample as policy-trainable or value-only
+- Keep ALL games (not just wins)
 
-1. **Load imitation checkpoint** (via `--resume` flag)
-2. **Keep all games in replay buffer** (not just wins)
-3. **Temperature schedule**: 1.0 for moves 1-30, 0.3 after (configure in self_play.py)
-4. **Larger replay buffer**: 100k samples (was 40k)
-5. **Cosine LR decay**: decrease lr from 0.001 to 0.0001 over training
+Changes to `alphazero/pipeline.py`:
+- Progressive simulation schedule (auto-increase based on arena results)
+- Larger replay buffer (100k)
+- Cosine LR decay
+- Load from imitation checkpoint
 
-### Step 3.3: Training Run
+### Step 4.3: Training Run
 
 ```bash
-python train_bootstrap.py --phase selfplay \
+python train_bootstrap.py selfplay \
     --checkpoint checkpoints_v2/imitation_final.pt \
     --num-iterations 200 \
     --num-workers 8
 ```
 
-Run overnight (8-24h). Monitor:
-- Win rate per iteration (should be >30% from start, rising)
-- Policy loss (should decrease from ~3-4 to <2)
-- Arena acceptance rate (should accept ~50-70% of iterations)
+**Expected throughput at 32 sims, 8 workers:** ~15-30 games/hour (vs ~3/hour at 200 sims)
+**Expected per-iteration:** ~50 games + training in ~15-20 minutes
 
-### Step 3.4: Scaling to win=6
+Monitor for:
+- Decisive game rate >30% from iteration 1 (thanks to warm start)
+- Policy loss decreasing (should start ~3-4, drop below 2 by iter 50)
+- Arena acceptance ~50-70% of iterations
+- Progressive sim increases at natural intervals
 
-After model plays well at win=5 (beats strong heuristic >90%):
+### Step 4.4: Scaling to win=6
 
+After model beats strong heuristic >90% at win=5:
 ```bash
-python train_bootstrap.py --phase selfplay \
+python train_bootstrap.py selfplay \
     --checkpoint checkpoints_v2/model_best.pt \
-    --win-length 6 \
-    --num-iterations 100
+    --win-length 6 --num-iterations 100
 ```
 
 ---
 
-## Phase 4: Evaluation & Polish
+## Phase 5: Evaluation & Polish
 
-### Step 4.1: Strength Evaluation
-
-- NN+MCTS (200 sims) vs strong heuristic: target >95% win rate
-- NN+MCTS (200 sims) vs NN+MCTS (50 sims): assess sim count impact
-- AI vs AI games: visual inspection for strategic quality
-
-### Step 4.2: Web UI Integration
-
-Update `play_web.py` to load the new model:
-- Default to v2 best model
-- Configurable MCTS simulations (time budget for real-time play)
-
-### Step 4.3: Documentation
-
-- Update CLAUDE.md with new training approach
-- Record training results and findings
+- [ ] NN+Gumbel MCTS (128 sims) vs strong heuristic: target >95% win rate
+- [ ] Web UI loads new model, plays responsively
+- [ ] Update CLAUDE.md with new training approach and results
+- [ ] Record training findings
 
 ---
 
@@ -267,7 +282,7 @@ Update `play_web.py` to load the new model:
 HeXO-alpha-zero/
   CLAUDE.md
   config.py                    # Updated with V2_CONFIG
-  train_bootstrap.py           # NEW: unified entry point (imitation → self-play)
+  train_bootstrap.py           # NEW: unified entry point
   play.py
   play_web.py
   hexo/
@@ -276,40 +291,31 @@ HeXO-alpha-zero/
     heuristic.py               # NEW: position evaluator + move selector
   alphazero/
     model.py
-    mcts.py
-    train.py
-    self_play.py               # MODIFIED: temperature schedule, keep all games
+    mcts.py                    # REWRITTEN: Gumbel selection + Sequential Halving
+    train.py                   # MODIFIED: playout cap awareness
+    self_play.py               # MODIFIED: Gumbel, playout cap, keep all games
     inference.py
     arena.py
-    pipeline.py                # MODIFIED: replay buffer size, LR decay
+    pipeline.py                # MODIFIED: progressive sims, larger buffer, LR decay
     imitation.py               # NEW: data generation + imitation training
   tests/
     test_game.py
-    test_mcts.py
+    test_mcts.py               # EXPANDED: Gumbel-specific tests
     test_model.py
-    test_heuristic.py          # NEW: heuristic player tests
-    test_imitation.py          # NEW: imitation learning tests
+    test_heuristic.py          # NEW
+    test_imitation.py          # NEW
   specs/
     _overview.md
+    001-approach-selection.md
     heuristic-player.md
     imitation-learning.md
     alphazero-training-v2.md
     implementation-plan.md
-  checkpoints_v2/              # NEW: v2 training checkpoints
+  checkpoints_v2/              # NEW
     imitation_final.pt
     model_iter{N}.pt
     model_best.pt
-  archive/                     # Superseded files
-    overnight_train.py
-    nn_curriculum_train.py
-    OVERNIGHT_PLAN.md
-    train_hexo.py
-    test_curriculum.py
-    test_curriculum2.py
-    test_seeding.py
-    test_training_signal.py
-    test_transfer.py
-    test_overnight_smoke.py
+  archive/                     # Superseded files (already moved)
 ```
 
 ---
@@ -318,16 +324,28 @@ HeXO-alpha-zero/
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| Heuristic too weak (draws only) | Low | Medium | Tune scoring weights, add randomness asymmetry |
-| Imitation model doesn't guide MCTS | Low | High | Validation gate prevents wasted self-play time |
-| Self-play stalls (no improvement) | Medium | Medium | Increase sims, tune exploration, try LR warmup |
-| VRAM OOM on large boards | Medium | Low | max_dim filter already proven effective |
-| Training too slow | Medium | Low | Start at 200 sims, increase if quality is good |
+| Heuristic too weak (all draws) | Low | Medium | Tune weights, add asymmetry |
+| Imitation model fails validation | Low | High | Validation gate prevents wasted self-play |
+| Gumbel top-k too small for HeXO | Medium | Medium | Start at k=16, increase if needed |
+| Self-play stalls | Low | Medium | Progressive schedule adapts; roll back to good checkpoint |
+| VRAM OOM | Medium | Low | max_dim filter proven effective |
+
+## Compute Budget
+
+**Conservative estimate for win=5 training (32→128 sims, 200 iterations):**
+- Self-play: ~15 games/hour × 200 iterations × 50 games = ~667 GPU-hours
+  → But with 8 workers generating in parallel: ~80 GPU-hours wall-clock
+- Training: ~4 epochs × 200 iterations × 2 min = ~27 hours
+- **Total wall-clock: ~24-48 hours** (overnight to 2 nights)
+
+**Compared to prior approach:** 14+ hours of overnight training produced 0 usable model.
+The new approach should produce a competent model in the first few hours of self-play
+thanks to the warm start + Gumbel efficiency.
 
 ## Success Criteria
 
-The project succeeds when:
-1. The model consistently wins against the heuristic player at full rules
-2. Self-play games show strategic depth (forks, multi-turn threats, blocking)
-3. The model improves over training iterations (measurable via arena)
-4. Human players find the AI challenging and "intelligent" via the web UI
+1. Model consistently beats heuristic at full rules
+2. Self-play games show strategic depth (forks, threats, blocking)
+3. Model improves measurably over training (arena wins)
+4. Entire training completes in <48 hours wall-clock
+5. No wasted compute — every phase has a validation gate before proceeding

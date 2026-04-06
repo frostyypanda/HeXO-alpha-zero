@@ -1,154 +1,180 @@
-# Feature: AlphaZero Training v2 (Warm-Start)
+# Feature: AlphaZero Training v2 (Gumbel + Warm-Start)
 
 ## Status
 draft
 
 ## Why this exists
 
-AlphaZero self-play is the proven path to superhuman game AI, but it requires a
-competent initial model to guide MCTS. Prior runs showed that starting from a random
-model leads to cold-start collapse (0 wins → no signal → model stays random).
+AlphaZero self-play is the proven path to superhuman game AI, but it requires:
+1. A competent initial model (solved by heuristic bootstrap — see imitation-learning.md)
+2. Efficient use of compute (solved by Gumbel MCTS + KataGo techniques)
 
-This spec describes the self-play training pipeline that starts from the
-imitation-learned model and refines it through self-play. This is the phase where the
-model surpasses its heuristic teacher and develops novel strategies.
+Prior runs wasted 14+ hours of GPU time because: (a) cold-start with random NN produced
+0 wins, and (b) standard PUCT MCTS at 200-800 sims was too expensive per game, producing
+too few training games per hour.
+
+This spec describes the self-play pipeline that starts from the imitation-learned model
+and uses Gumbel MCTS + playout cap randomization + progressive simulation to train
+efficiently.
 
 ## What it does
 
-### Training Loop
+### Gumbel MCTS (replaces standard PUCT)
 
-Standard AlphaZero loop, using the existing parallel infrastructure:
+Standard PUCT MCTS fails at low simulation counts because it can't reliably improve the
+policy with only 20-50 simulations across 300+ legal moves. Gumbel MCTS (DeepMind 2022)
+fixes this by:
+
+1. **Sample top-k moves from Gumbel-perturbed log-priors** — instead of exploring all
+   moves via UCB, only the top-k (e.g., 16-32) most promising moves are considered
+2. **Sequential Halving** — among the top-k, progressively eliminate the weaker half by
+   allocating simulations. After log2(k) rounds, only the best move remains
+3. **Guaranteed policy improvement** — the completed Q-values are provably better than
+   the raw policy, even with very few total simulations
+
+**Why this matters for HeXO:** With 300+ legal moves, standard MCTS at 50 sims spreads
+simulations too thin. Gumbel focuses all simulations on the ~16-32 moves the policy
+thinks are promising, then picks the best among those. This produces reliable policy
+improvement at 16-50 total simulations — 4-10x fewer than standard PUCT needs.
+
+### Playout Cap Randomization (KataGo)
+
+Not every training position needs deep search:
+
+- **25% of moves**: Full search (all simulations). Produces high-quality policy targets.
+- **75% of moves**: Quick search (1/4 of simulations). Produces more games per hour.
+
+Both contribute to value training (game outcomes are the same). Only the full-search
+positions contribute policy targets. This decouples:
+- **Policy learning** — needs deep search but few positions
+- **Value learning** — needs many games but shallow search is fine
+
+Net effect: ~1.4x more training data per GPU-hour for free.
+
+### Progressive Simulation Schedule
+
+Start training with low simulation counts and increase as the model strengthens:
+
+| Training phase | Simulations | Gumbel top-k | Rationale |
+|---------------|-------------|--------------|-----------|
+| Iterations 1-50 | 32 | 16 | Model is still crude. Fast games = more data = faster learning |
+| Iterations 51-100 | 64 | 16 | Model is competent. Moderate search for better policy targets |
+| Iterations 101+ | 128-200 | 32 | Model is strong. Deep search for refined policy |
+
+The schedule auto-adapts: if arena win rate vs previous best exceeds 60%, increase sims.
+If arena rejects 5 consecutive models, decrease sims (more data, less quality per game).
+
+### Training Loop
 
 ```
 for each iteration:
-    1. Parallel self-play (MCTS + current NN) → generate games
-    2. Add games to replay buffer
+    1. Parallel self-play (Gumbel MCTS + current NN) → generate games
+       - Apply playout cap randomization (25% full / 75% quick)
+    2. Add ALL games to replay buffer (wins, losses, AND draws)
     3. Train NN on replay buffer samples
-    4. Arena: pit new model vs previous best
+       - Policy target: Gumbel-completed visit distribution (full-search positions only)
+       - Value target: game outcome (+1/-1/0)
+    4. Arena: pit new model vs previous best (using full simulations)
     5. Keep stronger model, checkpoint
+    6. Adjust simulation count if needed (progressive schedule)
 ```
-
-Uses `alphazero/pipeline.py`'s `run_pipeline()` with these modifications:
-- **Start from imitation checkpoint** (not random weights)
-- **Full rules from the start** (win=5, dist=8, no curriculum)
-- **Train on ALL games** (not just wins)
-- **Larger replay buffer** (100k samples)
 
 ### Key Parameters
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| win_length | 5 | Training target (6 for official HeXO, but 5 is faster to validate) |
-| max_placement_dist | 8 | Full rules |
-| num_searches | 200-400 | Balance quality vs speed. Start at 200, increase if model stalls |
-| num_workers | 8 | Good utilization of 7800X3D (16 threads, leave headroom) |
-| batch_size | 128 | Large batches for stable training |
-| lr | 0.001 → 0.0001 | Cosine decay over training run |
-| replay_buffer_size | 100000 | ~500 games worth of data |
-| arena_games | 40 | Enough to detect improvement with confidence |
-| arena_threshold | 0.55 | Accept model if >55% win rate vs previous |
-| temperature | 1.0 (moves 1-30), 0.3 (moves 31+) | Explore early, exploit late |
-| dirichlet_epsilon | 0.25 | Standard AlphaZero root noise |
-| dirichlet_alpha | 0.15 | Lower alpha for larger action space (Go uses 0.03 for 19x19) |
+| win_length | 5 | Training target (scale to 6 later) |
+| max_placement_dist | 8 | Full rules from the start |
+| gumbel_top_k | 16 (early) → 32 (late) | Focus simulations on promising moves |
+| num_searches | 32 → 200 (progressive) | Start fast, increase quality over time |
+| playout_cap_fraction | 0.25 | 25% full search, 75% quick search |
+| num_workers | 8 | Good utilization of 7800X3D |
+| batch_size | 128 | Stable gradients |
+| lr | 0.001 → 0.0001 | Cosine decay |
+| replay_buffer_size | 100000 | ~500 games of data |
+| arena_games | 40 | Sufficient to detect improvement |
+| arena_threshold | 0.55 | Accept if >55% win rate |
+| temperature | 1.0 (moves 1-30), 0.3 (after) | Explore early, exploit late |
+| dirichlet_epsilon | 0.25 | Standard root noise |
+| dirichlet_alpha | 0.15 | Lower for large action space |
 
-### Training on All Games (Not Just Wins)
+### Train on ALL Games
 
-**Critical change from prior approach:** All games are kept, including draws.
+**Critical change from prior approach.** All games are kept:
+- Won games: positions labeled +1 (winner) / -1 (loser)
+- Drawn games: positions labeled 0
 
-For won games: positions labeled +1 (winner) / -1 (loser)
-For drawn games: all positions labeled 0
+This provides 10-100x more data than win-only filtering. Draws teach the value head that
+most positions are close to 0, with wins/losses being the exception.
 
-This provides 10-100x more training data than the win-only approach and teaches the
-value head the full range of position evaluations.
-
-### Monitoring & Diagnostics
+### Monitoring & Safeguards
 
 Each iteration logs:
-- Win rate (% of self-play games that end decisively)
-- Average game length
+- Win rate (% decisive games), average game length
 - Policy loss, value loss
 - Arena results (new vs best)
-- MCTS statistics (avg simulations, avg tree depth)
+- Current simulation count, games per hour
 
-**Warning signs that need intervention:**
-- Win rate drops to 0% for 10+ iterations → model collapsed, roll back to last good checkpoint
-- Policy loss increases steadily → learning rate too high or data quality issue
-- Arena consistently rejects new model → model plateaued, try increasing simulations or lr
+**Automatic safeguards:**
+- If 0 decisive games for 5 iterations → roll back to last good checkpoint + lower sims
+- If arena rejects 10 consecutive models → plateau detected, try LR bump or sim increase
+- Max board dimension filter (60px) prevents VRAM spikes
 
-### Checkpointing Strategy
+### Scaling to win=6
 
-- Save every 5 iterations: `model_iter{N}.pt`
-- Save after each arena acceptance: `model_best.pt`
-- Keep last 3 best models for rollback safety
-- Save optimizer state for resuming interrupted runs
-
-### Scaling Up to win=6 (Official HeXO)
-
-After the model plays well at win=5:
-1. Load the win=5 model
+After model plays well at win=5 (beats strong heuristic >90%):
+1. Load win=5 best model
 2. Switch to win=6 rules
-3. Continue self-play training
-
-This is the one curriculum step that SHOULD work because:
-- The spatial patterns learned at win=5 are directly relevant to win=6
-- The model already understands line-building, blocking, forking
-- win=6 is only 1 step harder than win=5 (not 2-3 steps like prior curriculum)
-- The model starts competent enough that MCTS can find wins
+3. Continue self-play — spatial patterns transfer well for +1 win length
 
 ## Boundaries & edge cases
 
 **What it intentionally does NOT do:**
-- No curriculum within this phase — single difficulty throughout
-- No NN-only fallback — always uses MCTS for self-play
-- No model architecture changes — same ResNet as before
-- No distributed training — single machine (RTX 4090 + 7800X3D)
+- No curriculum — single difficulty throughout (full rules)
+- No auxiliary targets in v2.0 (add later if model plateaus)
+- No hex symmetry augmentation in v2.0 (add later if data diversity is bottleneck)
+- No distributed training — single machine
 
 **Known limitations:**
-- Training time scales with game complexity (longer games = fewer iterations per hour)
-- At full rules (dist=8), boards can grow large, causing VRAM spikes on batching
-  - Mitigated by max_dim filter (drop states >60x60) and batch size tuning
-- Parallel self-play throughput depends on MCTS simulation count
-  - 200 sims: ~2-5 games/min across 8 workers
-  - 400 sims: ~1-3 games/min
-
-**Hard requirement:**
-- The imitation-learned model MUST pass validation gates before starting self-play
-  (see imitation-learning.md). Starting self-play with a bad model wastes hours.
+- Progressive simulation needs monitoring (auto-schedule may need manual override)
+- Gumbel top-k=16 may miss good moves in open positions (mitigated by Dirichlet noise)
+- Large boards (dist=8) can cause VRAM spikes — mitigated by max_dim filter
 
 ## Testing & verification
 
 ### Key scenarios
-- [ ] First self-play iteration produces >30% decisive games (not all draws)
+- [ ] Gumbel MCTS at 32 sims produces better policy than PUCT at 32 sims (on 100 positions)
+- [ ] First self-play iteration produces >30% decisive games
 - [ ] Policy loss decreases over first 20 iterations
+- [ ] Games per hour: >10 at 32 sims with 8 workers (throughput check)
 - [ ] New model beats imitation model in arena within 50 iterations
-- [ ] Model at iteration 100+ beats strong heuristic player >80%
-- [ ] Self-play games show recognizable strategic patterns (line extension, blocking, forks)
+- [ ] Model at iteration 100+ beats strong heuristic >80%
 
 ### Edge cases
-- Self-play produces all draws: model still too weak. Increase MCTS sims or re-do imitation
-- Arena always rejects new model: model plateaued. Increase exploration (dirichlet, temp)
-- VRAM OOM on large boards: reduce batch size or max_dim filter
-- Workers die mid-game: existing health check + restart logic in pipeline.py handles this
+- Self-play produces all draws: increase temperature, decrease sims (more exploration)
+- VRAM OOM on large boards: reduce batch size or max_dim
+- Gumbel top-k too small (misses good moves): increase k, check with Dirichlet noise
+- Workers die mid-game: existing health check handles this
 
 ### Automation notes
-- Automated: iteration loop, checkpointing, arena evaluation
-- Manual checkpoints: visual inspection of self-play games at iterations 0, 50, 100
-- End condition: run for N iterations or until arena plateau (10 consecutive rejections)
+- Automated: iteration loop, checkpointing, arena, progressive sim schedule
+- Manual checkpoints: visual inspection at iterations 0, 50, 100
+- End condition: N iterations or 10 consecutive arena rejections (plateau)
 
 ## Decision log
 | Date | Decision | Why | Who |
 |------|----------|-----|-----|
-| 2026-04-06 | Start at 200 sims (not 800) | Prior runs used 800 but were bottlenecked on game generation speed. 200 balances quality and throughput. Can increase later | Kei + Claude |
-| 2026-04-06 | Train on all games (not just wins) | The #1 failure mode was insufficient training data from win-only filtering. Draws teach the value head too | Kei + Claude |
-| 2026-04-06 | No curriculum, full rules from start | Curriculum failed due to transfer gaps. Imitation bootstrap makes curriculum unnecessary | Kei + Claude |
-| 2026-04-06 | Lower dirichlet_alpha (0.15 vs 0.3) | HeXO has ~300+ legal moves vs 361 for Go. Lower alpha = flatter noise = more exploration across large action space | Kei + Claude |
-| 2026-04-06 | win=5 first, then scale to win=6 | win=5 is faster to iterate on. win=5→6 is the one curriculum step with strong transfer (same spatial patterns, just 1 longer) | Kei + Claude |
+| 2026-04-06 | Gumbel MCTS over standard PUCT | Standard PUCT fails at <100 sims for 300+ action spaces. Gumbel guarantees improvement at 16-50 sims. 3-5x speedup | Kei + Claude |
+| 2026-04-06 | Playout cap randomization | KataGo showed 1.37x speedup. Decouples policy learning (needs deep search) from value learning (needs many games). Free improvement | Kei + Claude |
+| 2026-04-06 | Progressive simulation schedule | Early model doesn't benefit from deep search. Start fast (more games), increase quality as model improves. Validated by MiniZero 2024 | Kei + Claude |
+| 2026-04-06 | Start at 32 sims (not 200) | With Gumbel, 32 sims is productive. At 8 workers, this generates ~15+ games/hour vs ~3/hour at 200 sims. 5x more training data per hour | Kei + Claude |
+| 2026-04-06 | Train on all games (not just wins) | Prior approach: 0.3% win rate → ~50 training samples per iteration. All games: ~5000 samples. 100x more signal | Kei + Claude |
+| 2026-04-06 | No auxiliary targets initially | KataGo's ownership targets give 1.65x but add implementation complexity. Get baseline working first, add if model plateaus | Kei + Claude |
 
 ## Related
 - [specs/_overview.md](_overview.md) — epic context
+- [specs/001-approach-selection.md](001-approach-selection.md) — why this approach
 - [specs/imitation-learning.md](imitation-learning.md) — produces the starting model
-- `alphazero/pipeline.py` — `run_pipeline()` orchestrator
-- `alphazero/self_play.py` — parallel MCTS workers
-- `alphazero/inference.py` — batched GPU inference server
-- `alphazero/arena.py` — model evaluation
-- `config.py` — default hyperparameters (will be updated)
+- [specs/heuristic-player.md](heuristic-player.md) — bootstrap data source
+- `alphazero/mcts.py` — will be rewritten for Gumbel selection
+- `alphazero/pipeline.py` — modified for progressive sims, playout cap
